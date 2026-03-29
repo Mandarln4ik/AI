@@ -1,0 +1,33 @@
+# Основные зависимости
+faster-whisper>=1.0.0
+pyannote.audio>=3.1.0
+torch>=2.0.0
+torchaudio>=2.0.0
+numpy>=1.24.0
+sounddevice>=0.4.6
+pycaw>=20240101
+psutil>=5.9.0
+
+# LLM движки
+ollama>=0.1.0
+requests>=2.31.0
+llama-cpp-python>=0.2.0  # Для прямого использования llama.cpp с GPU
+
+# GUI
+PyQt6>=6.6.0
+PyQt6-Qt6>=6.6.0
+
+# Утилиты
+python-dotenv>=1.0.0
+loguru>=0.7.0
+pydantic>=2.5.0
+pyyaml>=6.0.1
+pyperclip>=1.8.0  # Для копирования ответов в буфер обмена
+
+# Для захвата экрана (визуальный контекст)
+mss>=9.0.1
+Pillow>=10.0.0
+
+# Для захвата аудио из конкретных приложений
+comtypes>=1.2.0; sys_platform == 'win32'
+pywin32>=306; sys_platform == 'win32'
