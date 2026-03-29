@@ -1,93 +1,130 @@
-"""
-Конфигурация ShadowSpeaker
-"""
 import os
+import json
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional, List, Dict, Any
 from pydantic import BaseModel, Field
+
+# Базовая директория для хранения данных
+BASE_DIR = Path(__file__).parent
+DATA_DIR = BASE_DIR / "data"
+MODELS_DIR = DATA_DIR / "models"
+CONFIG_FILE = DATA_DIR / "config.json"
+
+# Создаем директории если не существуют
+DATA_DIR.mkdir(exist_ok=True)
+MODELS_DIR.mkdir(exist_ok=True)
+
+
+class WhisperConfig(BaseModel):
+    """Конфигурация модели распознавания речи"""
+    model_path: Optional[str] = None  # Путь к .pt файлу или название модели
+    model_name: str = "large-v3-turbo"  # По умолчанию
+    device: str = "cuda"
+    compute_type: str = "float16"
+    language: str = "ru"  # Язык по умолчанию
+    use_speaker_diarization: bool = True
+
+
+class LLMProviderConfig(BaseModel):
+    """Конфигурация провайдера LLM"""
+    provider: str = "ollama"  # ollama, lmstudio, llama_cpp
+    model_name: str = "phi3"  # Модель по умолчанию
+    base_url: str = "http://localhost:11434"  # Для Ollama
+    lmstudio_port: int = 1234  # Для LM Studio
+    context_length: int = 4096
+    temperature: float = 0.7
+    max_tokens: int = 512
+
+
+class ScreenCaptureConfig(BaseModel):
+    """Конфигурация захвата экрана"""
+    enabled: bool = True
+    capture_interval: float = 10.0  # Секунды между захватами
+    monitor_index: int = 0  # Индекс монитора
+    resize_width: int = 800  # Изменение размера для оптимизации
+    resize_height: int = 600
+
+
+class MemoryConfig(BaseModel):
+    """Конфигурация памяти диалога"""
+    enabled: bool = True
+    max_duration_seconds: int = 300  # 5 минут
+    max_messages: int = 50  # Максимальное количество сообщений в памяти
+
+
+class AudioConfig(BaseModel):
+    """Конфигурация аудио"""
+    input_device: Optional[str] = None  # Название устройства ввода (Virtual Cable)
+    sample_rate: int = 16000
+    channels: int = 1
+    chunk_duration: float = 5.0  # Длительность чанка для обработки
+
+
+class OverlayConfig(BaseModel):
+    """Конфигурация оверлея"""
+    position_x: int = 100
+    position_y: int = 100
+    width: int = 400
+    height: int = 300
+    opacity: float = 0.8
+    font_size: int = 14
+    hotkey_toggle: str = "Ctrl+Shift+S"
+    hotkey_accept_1: str = "Ctrl+1"
+    hotkey_accept_2: str = "Ctrl+2"
+    hotkey_accept_3: str = "Ctrl+3"
 
 
 class Config(BaseModel):
-    # Пути
-    base_dir: Path = Path(__file__).parent
-    models_dir: Path = Field(default_factory=lambda: Path(__file__).parent / "models")
-    logs_dir: Path = Field(default_factory=lambda: Path(__file__).parent / "logs")
+    """Основная конфигурация приложения"""
+    whisper: WhisperConfig = Field(default_factory=WhisperConfig)
+    llm: LLMProviderConfig = Field(default_factory=LLMProviderConfig)
+    screen: ScreenCaptureConfig = Field(default_factory=ScreenCaptureConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    audio: AudioConfig = Field(default_factory=AudioConfig)
+    overlay: OverlayConfig = Field(default_factory=OverlayConfig)
     
-    # Аудио настройки
-    audio_sample_rate: int = 16000
-    audio_chunk_duration: float = 5.0  # секунд
-    silence_threshold: float = 0.01  # порог тишины
-    min_speech_duration: float = 0.5  # минимальная длительность речи
-    
-    # Настройки STT (Faster-Whisper)
-    whisper_model: str = "medium"  # tiny, base, small, medium, large-v2
-    whisper_device: str = "cuda"  # cuda, cpu
-    whisper_compute_type: str = "float16"  # float16, int8, int8_float16
-    
-    # Диаризация спикеров
-    use_diarization: bool = True
-    diarization_model: str = "pyannote/speaker-diarization-3.1"
-    max_speakers: int = 5  # максимальное количество спикеров
-    
-    # LLM настройки
-    llm_provider: str = "ollama"  # ollama, lmstudio, llama_cpp
-    llm_model: str = "llama3.2"  # llama3.2, phi3, mistral или имя модели в LM Studio
-    llm_host: str = "http://localhost:11434"  # Ollama: 11434, LM Studio: 1234
-    llm_context_length: int = 4096
-    llm_temperature: float = 0.7
-    llm_max_tokens: int = 150
-    
-    # Whisper модель - путь к файлу или название
-    whisper_model_path: Optional[str] = None  # Путь к .pt файлу (например large-v3-turbo.pt)
-    whisper_model_name: str = "medium"  # tiny, base, small, medium, large-v2, large-v3-turbo
-    
-    # Захват экрана для визуального контекста
-    enable_screen_capture: bool = True
-    screen_capture_interval: float = 10.0  # Захватывать экран каждые N секунд
-    screen_monitor_index: int = 1  # Индекс монитора (0 - основной)
-    
-    # Количество вариантов ответов
-    response_variants_count: int = 3
-    
-    # Оверлей настройки
-    overlay_position: str = "bottom_right"  # top_left, top_right, bottom_left, bottom_right
-    overlay_opacity: float = 0.9
-    overlay_font_size: int = 14
-    overlay_max_width: int = 600
-    overlay_margin: int = 20
-    
-    # Горячие клавиши (Windows virtual key codes)
-    hotkey_select_1: str = "Ctrl+1"
-    hotkey_select_2: str = "Ctrl+2"
-    hotkey_select_3: str = "Ctrl+3"
-    hotkey_refresh: str = "Ctrl+R"
-    hotkey_toggle: str = "Ctrl+H"
-    hotkey_settings: str = "Ctrl+S"  # Горячая клавиша для настроек
-    hotkey_quit: str = "Ctrl+Q"
-    
-    # Профиль пользователя для идентификации
-    user_voice_profile: Optional[str] = None  # имя/метка пользователя
-    user_speaker_id: Optional[int] = None  # ID спикера если известен
-    
-    # Приложения для захвата звука
-    target_applications: List[str] = Field(default_factory=lambda: [
-        "Discord",
-        "TeamSpeak",
-        "Skype",
-        "Zoom"
-    ])
-    
-    # Логирование
-    log_level: str = "INFO"
-    log_file: str = "shadow_speaker.log"
-    
+    # Список доступных моделей (заполняется автоматически)
+    available_whisper_models: List[str] = []
+    available_llm_models: List[str] = []
+
     class Config:
         arbitrary_types_allowed = True
 
 
-# Глобальный экземпляр конфигурации
-config = Config()
+def load_config() -> Config:
+    """Загрузка конфигурации из файла"""
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return Config(**data)
+        except Exception as e:
+            print(f"Ошибка загрузки конфига: {e}, используем значения по умолчанию")
+    return Config()
 
-# Создаем директории если не существуют
-config.models_dir.mkdir(exist_ok=True)
-config.logs_dir.mkdir(exist_ok=True)
+
+def save_config(config: Config) -> None:
+    """Сохранение конфигурации в файл"""
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config.model_dump(), f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Ошибка сохранения конфига: {e}")
+
+
+def get_available_whisper_models() -> List[str]:
+    """Получение списка доступных моделей Whisper"""
+    models = ["large-v3-turbo", "medium", "small", "base", "tiny"]
+    
+    # Добавляем пользовательские .pt файлы
+    if MODELS_DIR.exists():
+        for file in MODELS_DIR.glob("*.pt"):
+            models.append(file.name)
+    
+    return models
+
+
+def get_available_llm_models(provider: str, base_url: str = "") -> List[str]:
+    """Получение списка доступных LLM моделей от провайдера"""
+    # Это будет заполняться динамически через API
+    return []

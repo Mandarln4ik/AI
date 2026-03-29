@@ -1,373 +1,254 @@
-"""
-LLM движок для генерации вариантов ответов
-Поддержка Ollama, LM Studio и llama.cpp
-"""
 import requests
-from typing import List, Dict, Optional
-from loguru import logger
 import json
-import threading
+from typing import List, Dict, Optional, Any
+from datetime import datetime
+from config import Config
 
 
 class LLMEngine:
-    """
-    Движок для генерации ответов через локальную LLM
-    Поддерживаемые провайдеры: ollama, lmstudio, llama_cpp
-    """
+    """Движок для работы с различными LLM провайдерами"""
     
-    def __init__(self, config):
+    def __init__(self, config: Config):
         self.config = config
-        self.is_initialized = False
-        self._generation_lock = threading.Lock()
-        self.provider_name = "Unknown"
+        self.provider = config.llm.provider
+        self.model_name = config.llm.model_name
+        self.base_url = config.llm.base_url
+        self.lmstudio_port = config.llm.lmstudio_port
+        self.temperature = config.llm.temperature
+        self.max_tokens = config.llm.max_tokens
+        self.context_length = config.llm.context_length
         
-        # Контекст беседы
-        self.conversation_history = []
+        # История запросов для отладки
+        self.request_history: List[Dict[str, Any]] = []
         
-        # Системный промпт
-        self.system_prompt = """Ты - умный ассистент который помогает пользователю в диалогах.
-Твоя задача - предлагать краткие, естественные варианты ответов для использования в разговоре.
-
-Правила:
-1. Ответы должны быть короткими (1-2 предложения)
-2. Естественными и подходящими для устной речи
-3. Предложи 3 разных варианта с разной тональностью:
-   - Нейтральный/вежливый
-   - Дружелюбный/неформальный  
-   - Краткий/по делу
-4. Учитывай контекст беседы
-5. Не используй эмодзи и специальные символы
-6. Пиши на том же языке что и собеседник
-
-Формат ответа строго JSON:
-{
-  "variants": [
-    {"style": "neutral", "text": "..."},
-    {"style": "friendly", "text": "..."},
-    {"style": "concise", "text": "..."}
-  ]
-}"""
+        # Проверка доступности провайдера
+        self._check_provider_availability()
     
-    def initialize(self) -> bool:
-        """Инициализация соединения с LLM"""
+    def _check_provider_availability(self) -> bool:
+        """Проверка доступности провайдера"""
         try:
-            if self.config.llm_provider == "ollama":
-                # Проверка доступности Ollama
-                response = requests.get(f"{self.config.llm_host}/api/tags", timeout=5)
-                if response.status_code == 200:
-                    models = response.json().get("models", [])
-                    model_names = [m["name"] for m in models]
-                    
-                    if self.config.llm_model in model_names or any(self.config.llm_model in m for m in model_names):
-                        logger.info(f"Ollama is running with model: {self.config.llm_model}")
-                    else:
-                        logger.warning(f"Model {self.config.llm_model} not found. Available: {model_names}")
-                        logger.warning("Please run: ollama pull " + self.config.llm_model)
-                    
-                    self.provider_name = "Ollama"
-                    self.is_initialized = True
-                    return True
-                else:
-                    logger.error(f"Ollama not responding: {response.status_code}")
-                    logger.error("Please start Ollama service")
-                    return False
-                    
-            elif self.config.llm_provider == "lmstudio":
-                # Проверка доступности LM Studio Server
-                response = requests.get(f"{self.config.llm_host}/v1/models", timeout=5)
-                if response.status_code == 200:
-                    models_data = response.json().get("data", [])
-                    model_names = [m["id"] for m in models_data]
-                    
-                    if self.config.llm_model in model_names or any(self.config.llm_model in m for m in model_names):
-                        logger.info(f"LM Studio is running with model: {self.config.llm_model}")
-                    else:
-                        logger.warning(f"Model {self.config.llm_model} not found in LM Studio. Available: {model_names}")
-                        logger.warning("Make sure to load a model in LM Studio and enable local server")
-                    
-                    self.provider_name = "LM Studio"
-                    self.is_initialized = True
-                    return True
-                else:
-                    logger.error(f"LM Studio not responding: {response.status_code}")
-                    logger.error("Please start LM Studio and enable 'Local Server' on port 1234")
-                    return False
-            
-            elif self.config.llm_provider == "llama_cpp":
-                # llama.cpp через прямой вызов (требует установки llama-cpp-python)
-                try:
-                    from llama_cpp import Llama
-                    logger.info(f"llama_cpp provider selected, will load model: {self.config.llm_model}")
-                    self.provider_name = "llama.cpp"
-                    self.is_initialized = True
-                    return True
-                except ImportError:
-                    logger.error("llama-cpp-python not installed")
-                    logger.error("Install with: pip install llama-cpp-python")
-                    return False
-            
+            if self.provider == "ollama":
+                response = requests.get(f"{self.base_url}/api/tags", timeout=5)
+                return response.status_code == 200
+            elif self.provider == "lmstudio":
+                response = requests.get(f"http://localhost:{self.lmstudio_port}/v1/models", timeout=5)
+                return response.status_code == 200
+            elif self.provider == "llama_cpp":
+                # llama.cpp обычно работает через локальный сервер, проверяем как ollama
+                return True  # Предполагаем доступность
             else:
-                logger.error(f"Unsupported LLM provider: {self.config.llm_provider}")
-                logger.error("Supported providers: ollama, lmstudio, llama_cpp")
+                print(f"Неизвестный провайдер: {self.provider}")
                 return False
-                
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"Cannot connect to LLM provider: {e}")
-            if self.config.llm_provider == "ollama":
-                logger.error("Start with: ollama serve")
-            elif self.config.llm_provider == "lmstudio":
-                logger.error("Open LM Studio and enable 'Local Server' in settings")
-            return False
         except Exception as e:
-            logger.error(f"LLM initialization failed: {e}")
+            print(f"Провайдер {self.provider} недоступен: {e}")
             return False
     
-    def generate_response_variants(self, conversation_context: str, user_speaker: str, screen_context: str = "") -> List[Dict[str, str]]:
+    def generate_response(self, 
+                         dialogue_context: str, 
+                         screen_context: str = "", 
+                         screenshot_base64: Optional[str] = None,
+                         num_options: int = 3) -> List[str]:
         """
-        Генерация вариантов ответов на основе контекста беседы
+        Генерация вариантов ответов на основе контекста диалога и экрана
         
         Args:
-            conversation_context: Текст последних реплик
-            user_speaker: ID спикера пользователя
-            screen_context: Визуальный контекст с экрана (опционально)
+            dialogue_context: Текст диалога за последние несколько минут
+            screen_context: Описание визуального контекста
+            screenshot_base64: Скриншот в base64 (для мультимодальных моделей)
+            num_options: Количество вариантов ответов для генерации
         
         Returns:
             Список вариантов ответов
         """
-        if not self.is_initialized:
-            logger.warning("LLM not initialized")
-            return self._get_fallback_responses()
-        
-        with self._generation_lock:
-            try:
-                # Формируем промпт с учетом визуального контекста
-                prompt = self._build_prompt(conversation_context, user_speaker, screen_context)
-                
-                if self.config.llm_provider == "ollama":
-                    variants = self._query_ollama(prompt)
-                    if variants:
-                        return variants
-                
-                elif self.config.llm_provider == "lmstudio":
-                    variants = self._query_lmstudio(prompt)
-                    if variants:
-                        return variants
-                
-                elif self.config.llm_provider == "llama_cpp":
-                    variants = self._query_llama_cpp(prompt)
-                    if variants:
-                        return variants
-                
-                return self._get_fallback_responses()
-                
-            except Exception as e:
-                logger.error(f"Response generation failed: {e}")
-                return self._get_fallback_responses()
-    
-    def _build_prompt(self, context: str, user_speaker: str, screen_context: str = "") -> str:
-        """Построение промпта для LLM с учетом визуального контекста"""
-        # Определяем последнюю реплику не от пользователя
-        lines = context.split("\n")
-        last_other_speech = ""
-        
-        for line in reversed(lines):
-            if line.strip() and not line.startswith(user_speaker):
-                last_other_speech = line
-                break
-        
-        prompt = f"""Контекст беседы:
-{context}
+        system_prompt = """Ты - умный ассистент, который помогает пользователю в реальных диалогах.
+Твоя задача - анализировать контекст беседы и предлагать 3 варианта ответа, которые пользователь может использовать.
 
-Последняя реплика собеседника: {last_other_speech}
-"""
+Требования к ответам:
+1. Ответы должны быть естественными и соответствовать стилю беседы
+2. Учитывай контекст диалога (что обсуждалось ранее)
+3. Если есть визуальный контекст (игра, приложение), учитывай его
+4. Предложи разные варианты: согласиться, возразить, уточнить, перевести тему
+5. Ответы должны быть краткими (1-2 предложения)
+6. Язык ответов должен соответствовать языку диалога
+
+Формат вывода:
+Просто перечисли 3 варианта, каждый с новой строки, без нумерации и дополнительных пояснений."""
+
+        user_prompt = f"""Контекст диалога (последние 5 минут):
+{dialogue_context}
+
+{screen_context}
+
+Сгенерируй 3 варианта ответа для пользователя:"""
+
+        try:
+            if self.provider == "ollama":
+                return self._generate_ollama(system_prompt, user_prompt, num_options)
+            elif self.provider == "lmstudio":
+                return self._generate_lmstudio(system_prompt, user_prompt, num_options)
+            elif self.provider == "llama_cpp":
+                return self._generate_llama_cpp(system_prompt, user_prompt, num_options)
+            else:
+                raise ValueError(f"Неподдерживаемый провайдер: {self.provider}")
         
-        if screen_context:
-            prompt += f"\nВизуальный контекст (что видно на экране): {screen_context}\n"
+        except Exception as e:
+            print(f"Ошибка генерации ответа: {e}")
+            return ["Извините, не могу сейчас помочь с ответом.", 
+                    "Давайте продолжим разговор позже.",
+                    "Я анализирую ситуацию..."]
+    
+    def _generate_ollama(self, system_prompt: str, user_prompt: str, num_options: int) -> List[str]:
+        """Генерация через Ollama"""
+        url = f"{self.base_url}/api/generate"
         
-        prompt += f"\nПредложи 3 варианта ответа для {user_speaker}.\n"
-        return prompt
-    
-    def _query_ollama(self, prompt: str) -> Optional[List[Dict[str, str]]]:
-        """Запрос к Ollama API"""
-        try:
-            payload = {
-                "model": self.config.llm_model,
-                "prompt": prompt,
-                "system": self.system_prompt,
-                "stream": False,
-                "options": {
-                    "temperature": self.config.llm_temperature,
-                    "num_predict": self.config.llm_max_tokens,
-                    "top_p": 0.9
-                }
+        payload = {
+            "model": self.model_name,
+            "prompt": user_prompt,
+            "system": system_prompt,
+            "stream": False,
+            "options": {
+                "temperature": self.temperature,
+                "num_predict": self.max_tokens
             }
-            
-            response = requests.post(
-                f"{self.config.llm_host}/api/generate",
-                json=payload,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                text = result.get("response", "")
-                
-                # Парсим JSON из ответа
-                variants = self._parse_response_variants(text)
-                if variants:
-                    logger.info(f"Generated {len(variants)} response variants via Ollama")
-                    return variants
-            
-            logger.warning(f"Ollama returned status {response.status_code}")
-            return None
-            
-        except Exception as e:
-            logger.error(f"Ollama query failed: {e}")
-            return None
+        }
+        
+        response = requests.post(url, json=payload, timeout=60)
+        response.raise_for_status()
+        
+        result = response.json()
+        generated_text = result.get("response", "")
+        
+        # Парсинг вариантов ответов
+        options = self._parse_response_options(generated_text, num_options)
+        
+        self._log_request("ollama", payload, options)
+        
+        return options
     
-    def _query_lmstudio(self, prompt: str) -> Optional[List[Dict[str, str]]]:
-        """Запрос к LM Studio API (OpenAI-compatible)"""
-        try:
-            payload = {
-                "model": self.config.llm_model,
-                "messages": [
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": self.config.llm_temperature,
-                "max_tokens": self.config.llm_max_tokens,
-                "stream": False
-            }
-            
-            response = requests.post(
-                f"{self.config.llm_host}/v1/chat/completions",
-                json=payload,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-                
-                # Парсим JSON из ответа
-                variants = self._parse_response_variants(text)
-                if variants:
-                    logger.info(f"Generated {len(variants)} response variants via LM Studio")
-                    return variants
-            
-            logger.warning(f"LM Studio returned status {response.status_code}")
-            return None
-            
-        except Exception as e:
-            logger.error(f"LM Studio query failed: {e}")
-            return None
-    
-    def _query_llama_cpp(self, prompt: str) -> Optional[List[Dict[str, str]]]:
-        """Запрос к llama.cpp напрямую"""
-        try:
-            from llama_cpp import Llama
-            
-            # Загружаем модель если путь указан
-            model_path = self.config.llm_model
-            if not model_path.endswith('.gguf'):
-                logger.error("llama_cpp requires a .gguf model file path")
-                return None
-            
-            llm = Llama(
-                model_path=model_path,
-                n_ctx=self.config.llm_context_length,
-                n_gpu_layers=-1,  # Использовать все слои GPU
-                verbose=False
-            )
-            
-            full_prompt = f"{self.system_prompt}\n\n{prompt}"
-            
-            output = llm(
-                full_prompt,
-                max_tokens=self.config.llm_max_tokens,
-                temperature=self.config.llm_temperature,
-                top_p=0.9,
-                stop=["}", "\n\n"],
-                echo=False
-            )
-            
-            text = output["choices"][0]["text"]
-            
-            # Парсим JSON из ответа
-            variants = self._parse_response_variants(text)
-            if variants:
-                logger.info(f"Generated {len(variants)} response variants via llama.cpp")
-                return variants
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"llama.cpp query failed: {e}")
-            return None
-    
-    def _parse_response_variants(self, text: str) -> Optional[List[Dict[str, str]]]:
-        """Парсинг JSON ответа с вариантами"""
-        try:
-            # Ищем JSON в тексте
-            start_idx = text.find("{")
-            end_idx = text.rfind("}") + 1
-            
-            if start_idx >= 0 and end_idx > start_idx:
-                json_str = text[start_idx:end_idx]
-                data = json.loads(json_str)
-                
-                if "variants" in data:
-                    variants = data["variants"]
-                    # Валидация
-                    if isinstance(variants, list) and len(variants) >= 1:
-                        return variants[:self.config.response_variants_count]
-            
-            # Пробуем найти варианты в другом формате
-            lines = text.strip().split("\n")
-            variants = []
-            
-            for i, line in enumerate(lines[:5], 1):
-                clean_line = line.strip().lstrip("123456789.-)").strip()
-                if clean_line and len(clean_line) > 5:
-                    variants.append({
-                        "style": f"variant_{i}",
-                        "text": clean_line
-                    })
-            
-            if variants:
-                return variants[:self.config.response_variants_count]
-            
-            return None
-            
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse JSON response: {e}")
-            return None
-        except Exception as e:
-            logger.warning(f"Error parsing variants: {e}")
-            return None
-    
-    def _get_fallback_responses(self) -> List[Dict[str, str]]:
-        """Запасные варианты если LLM недоступна"""
-        return [
-            {"style": "neutral", "text": "Понял, продолжайте."},
-            {"style": "friendly", "text": "Интересно! Расскажи подробнее."},
-            {"style": "concise", "text": "Ясно."}
+    def _generate_lmstudio(self, system_prompt: str, user_prompt: str, num_options: int) -> List[str]:
+        """Генерация через LM Studio (OpenAI-compatible API)"""
+        url = f"http://localhost:{self.lmstudio_port}/v1/chat/completions"
+        
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
         ]
+        
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "stream": False
+        }
+        
+        response = requests.post(url, json=payload, timeout=60)
+        response.raise_for_status()
+        
+        result = response.json()
+        generated_text = result["choices"][0]["message"]["content"]
+        
+        options = self._parse_response_options(generated_text, num_options)
+        
+        self._log_request("lmstudio", payload, options)
+        
+        return options
     
-    def add_to_history(self, speaker: str, text: str):
-        """Добавить реплику в историю"""
-        self.conversation_history.append({
-            "speaker": speaker,
-            "text": text,
-            "timestamp": None  # можно добавить время
+    def _generate_llama_cpp(self, system_prompt: str, user_prompt: str, num_options: int) -> List[str]:
+        """Генерация через llama.cpp (через локальный сервер)"""
+        # По умолчанию используем тот же API что и Ollama, если сервер запущен
+        # Можно настроить под конкретную реализацию llama.cpp
+        return self._generate_ollama(system_prompt, user_prompt, num_options)
+    
+    def _parse_response_options(self, text: str, num_options: int) -> List[str]:
+        """Парсинг сгенерированного текста в список вариантов"""
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        
+        # Фильтрация пустых строк и служебных символов
+        options = []
+        for line in lines:
+            # Удаление нумерации (1., 2., 3. или - или *)
+            cleaned = line.lstrip('0123456789.-* ')
+            if cleaned and len(cleaned) > 5:  # Минимальная длина ответа
+                options.append(cleaned)
+        
+        # Если не хватило вариантов, дополняем заглушками
+        while len(options) < num_options:
+            options.append("Нужно подумать над ответом...")
+        
+        return options[:num_options]
+    
+    def _log_request(self, provider: str, request_data: Dict, response_options: List[str]) -> None:
+        """Логирование запроса для отладки"""
+        self.request_history.append({
+            "timestamp": datetime.now().isoformat(),
+            "provider": provider,
+            "request": request_data,
+            "response_count": len(response_options)
         })
         
-        # Ограничиваем историю
-        max_history = 20
-        if len(self.conversation_history) > max_history:
-            self.conversation_history = self.conversation_history[-max_history:]
+        # Ограничение истории
+        if len(self.request_history) > 100:
+            self.request_history.pop(0)
     
-    def clear_history(self):
-        """Очистить историю беседы"""
-        self.conversation_history = []
-        logger.info("Conversation history cleared")
+    def get_available_models(self) -> List[str]:
+        """Получение списка доступных моделей от провайдера"""
+        try:
+            if self.provider == "ollama":
+                response = requests.get(f"{self.base_url}/api/tags", timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    return [model["name"] for model in data.get("models", [])]
+            
+            elif self.provider == "lmstudio":
+                response = requests.get(f"http://localhost:{self.lmstudio_port}/v1/models", timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    return [model["id"] for model in data.get("data", [])]
+            
+            elif self.provider == "llama_cpp":
+                # Для llama.cpp список моделей зависит от реализации
+                return [self.model_name]
+        
+        except Exception as e:
+            print(f"Ошибка получения списка моделей: {e}")
+        
+        return [self.model_name]
+    
+    def test_connection(self) -> Dict[str, Any]:
+        """Тестирование соединения с провайдером"""
+        result = {
+            "success": False,
+            "provider": self.provider,
+            "model": self.model_name,
+            "message": ""
+        }
+        
+        try:
+            if self.provider == "ollama":
+                response = requests.get(f"{self.base_url}/api/tags", timeout=10)
+                if response.status_code == 200:
+                    result["success"] = True
+                    result["message"] = "Ollama подключена успешно"
+                else:
+                    result["message"] = f"Ошибка подключения к Ollama: {response.status_code}"
+            
+            elif self.provider == "lmstudio":
+                response = requests.get(f"http://localhost:{self.lmstudio_port}/v1/models", timeout=10)
+                if response.status_code == 200:
+                    result["success"] = True
+                    result["message"] = "LM Studio подключена успешно"
+                else:
+                    result["message"] = f"Ошибка подключения к LM Studio: {response.status_code}"
+            
+            elif self.provider == "llama_cpp":
+                result["success"] = True
+                result["message"] = "llama.cpp настроен (требуется ручной запуск сервера)"
+            
+            else:
+                result["message"] = f"Неизвестный провайдер: {self.provider}"
+        
+        except Exception as e:
+            result["message"] = f"Ошибка подключения: {str(e)}"
+        
+        return result

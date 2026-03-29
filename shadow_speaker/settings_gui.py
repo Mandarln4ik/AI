@@ -1,497 +1,501 @@
-"""
-GUI для настройки ShadowSpeaker
-Управление провайдерами LLM, выбор моделей, импорт Whisper моделей
-"""
 import sys
 import os
-from pathlib import Path
-from typing import Optional, List, Dict
-from loguru import logger
-
-try:
-    from PyQt6.QtWidgets import (
-        QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
-        QLabel, QPushButton, QComboBox, QLineEdit, 
-        QSpinBox, QDoubleSpinBox, QGroupBox, QFormLayout,
-        QTabWidget, QDialog, QDialogButtonBox, QFileDialog,
-        QMessageBox, QListWidget, QListWidgetItem, QCheckBox,
-        QProgressBar, QTextEdit
-    )
-    from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-    from PyQt6.QtGui import QFont
-    PYQT_AVAILABLE = True
-except ImportError:
-    PYQT_AVAILABLE = False
-    logger.warning("PyQt6 not available, settings GUI disabled")
-
-import requests
-import json
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+                             QHBoxLayout, QLabel, QPushButton, QTextEdit, QTabWidget,
+                             QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox, QFileDialog,
+                             QGroupBox, QFormLayout, QCheckBox, QMessageBox, QListWidget)
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QFont
+from config import Config, load_config, save_config, get_available_whisper_models, MODELS_DIR
+from llm_engine import LLMEngine
 
 
-class ModelDownloader(QThread):
-    """Поток для загрузки моделей"""
-    progress = pyqtSignal(int, str)  # percent, message
-    finished = pyqtSignal(bool, str)  # success, message
+class SettingsWindow(QMainWindow):
+    """Окно настроек приложения"""
     
-    def __init__(self, provider: str, host: str, model_name: str):
+    settings_saved = pyqtSignal(Config)  # Сигнал сохранения настроек
+    
+    def __init__(self, config: Config):
         super().__init__()
-        self.provider = provider
-        self.host = host
-        self.model_name = model_name
-    
-    def run(self):
-        try:
-            if self.provider == "ollama":
-                # Ollama pull через API
-                self.progress.emit(0, f"Starting download of {self.model_name}...")
-                
-                response = requests.post(
-                    f"{self.host}/api/pull",
-                    json={"name": self.model_name},
-                    stream=True,
-                    timeout=600
-                )
-                
-                if response.status_code != 200:
-                    self.finished.emit(False, f"Failed to start download: {response.status_code}")
-                    return
-                
-                total_size = 0
-                downloaded = 0
-                
-                for line in response.iter_lines():
-                    if line:
-                        data = json.loads(line)
-                        if "total" in data:
-                            total_size = data["total"]
-                        if "completed" in data:
-                            downloaded = data["completed"]
-                        
-                        if total_size > 0:
-                            percent = int((downloaded / total_size) * 100)
-                            status = data.get("status", "downloading")
-                            self.progress.emit(percent, f"{status}: {percent}%")
-                        
-                        if data.get("status") == "success":
-                            self.progress.emit(100, "Download complete!")
-                            self.finished.emit(True, f"Model {self.model_name} downloaded successfully")
-                            return
-                
-                self.finished.emit(True, "Download completed")
-                
-            elif self.provider == "lmstudio":
-                # LM Studio не поддерживает загрузку через API, только уведомление
-                self.progress.emit(50, "LM Studio requires manual model download")
-                self.progress.emit(100, "Open LM Studio UI to download models")
-                self.finished.emit(
-                    False, 
-                    "LM Studio: Please download models through LM Studio interface. "
-                    "The local server only serves already loaded models."
-                )
-            
-        except Exception as e:
-            self.finished.emit(False, f"Download error: {str(e)}")
-
-
-class SettingsDialog(QDialog):
-    """Диалог настроек приложения"""
-    
-    def __init__(self, config, parent=None):
-        super().__init__(parent)
         self.config = config
-        self.setWindowTitle("ShadowSpeaker - Настройки")
-        self.setMinimumSize(700, 600)
+        self.setWindowTitle("Настройки ShadowSpeaker")
+        self.setMinimumSize(700, 500)
         
-        self.setup_ui()
+        self._setup_ui()
+        self._load_current_settings()
     
-    def setup_ui(self):
-        layout = QVBoxLayout(self)
+    def _setup_ui(self):
+        """Настройка интерфейса"""
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
         
-        # Создаем вкладки
-        tabs = QTabWidget()
+        layout = QVBoxLayout(central_widget)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
         
-        # Вкладка LLM
-        llm_tab = self.create_llm_tab()
-        tabs.addTab(llm_tab, "LLM Провайдер")
+        # Заголовок
+        title_label = QLabel("⚙ Настройки ShadowSpeaker")
+        title_label.setFont(QFont("Arial", 18, QFont.Weight.Bold))
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title_label)
         
-        # Вкладка Whisper
-        whisper_tab = self.create_whisper_tab()
-        tabs.addTab(whisper_tab, "Whisper STT")
+        # Вкладки
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+        
+        # Вкладка Whisper STT
+        whisper_tab = self._create_whisper_tab()
+        self.tabs.addTab(whisper_tab, "🎤 Whisper STT")
+        
+        # Вкладка LLM Провайдер
+        llm_tab = self._create_llm_tab()
+        self.tabs.addTab(llm_tab, "🧠 LLM Провайдер")
         
         # Вкладка Аудио
-        audio_tab = self.create_audio_tab()
-        tabs.addTab(audio_tab, "Аудио")
+        audio_tab = self._create_audio_tab()
+        self.tabs.addTab(audio_tab, "🔊 Аудио")
+        
+        # Вкладка Экран
+        screen_tab = self._create_screen_tab()
+        self.tabs.addTab(screen_tab, "🖥 Экран")
         
         # Вкладка Оверлей
-        overlay_tab = self.create_overlay_tab()
-        tabs.addTab(overlay_tab, "Оверлей")
-        
-        layout.addWidget(tabs)
+        overlay_tab = self._create_overlay_tab()
+        self.tabs.addTab(overlay_tab, "📟 Оверлей")
         
         # Кнопки
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | 
-            QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.save_settings)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        
+        cancel_btn = QPushButton("Отмена")
+        cancel_btn.setFixedSize(120, 40)
+        cancel_btn.clicked.connect(self.close)
+        button_layout.addWidget(cancel_btn)
+        
+        save_btn = QPushButton("💾 Сохранить")
+        save_btn.setFixedSize(120, 40)
+        save_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+        """)
+        save_btn.clicked.connect(self._save_settings)
+        button_layout.addWidget(save_btn)
+        
+        layout.addLayout(button_layout)
     
-    def create_llm_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QFormLayout(tab)
+    def _create_whisper_tab(self) -> QWidget:
+        """Создание вкладки Whisper"""
+        widget = QWidget()
+        layout = QFormLayout(widget)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
         
-        # Выбор провайдера
-        self.provider_combo = QComboBox()
-        self.provider_combo.addItems(["ollama", "lmstudio", "llama_cpp"])
-        self.provider_combo.setCurrentText(self.config.llm_provider)
-        self.provider_combo.currentTextChanged.connect(self.on_provider_changed)
-        layout.addRow("Провайдер:", self.provider_combo)
-        
-        # Хост
-        self.host_edit = QLineEdit(self.config.llm_host)
-        layout.addRow("Хост API:", self.host_edit)
-        
-        # Модель
-        self.model_edit = QLineEdit(self.config.llm_model)
-        layout.addRow("Модель:", self.model_edit)
-        
-        # Кнопка проверки соединения
-        self.check_conn_btn = QPushButton("Проверить соединение")
-        self.check_conn_btn.clicked.connect(self.check_connection)
-        layout.addRow("", self.check_conn_btn)
-        
-        # Кнопка загрузки модели
-        self.download_model_btn = QPushButton("Загрузить модель")
-        self.download_model_btn.clicked.connect(self.download_model)
-        layout.addRow("", self.download_model_btn)
-        
-        # Статус загрузки
-        self.download_status = QLabel("")
-        self.download_progress = QProgressBar()
-        self.download_progress.setVisible(False)
-        layout.addRow("", self.download_status)
-        layout.addRow("", self.download_progress)
-        
-        # Температура
-        self.temp_spin = QDoubleSpinBox()
-        self.temp_spin.setRange(0.0, 2.0)
-        self.temp_spin.setSingleStep(0.1)
-        self.temp_spin.setValue(self.config.llm_temperature)
-        layout.addRow("Температура:", self.temp_spin)
-        
-        # Макс токенов
-        self.max_tokens_spin = QSpinBox()
-        self.max_tokens_spin.setRange(50, 4096)
-        self.max_tokens_spin.setValue(self.config.llm_max_tokens)
-        layout.addRow("Макс токенов:", self.max_tokens_spin)
-        
-        # Список доступных моделей
-        models_group = QGroupBox("Доступные модели")
-        models_layout = QVBoxLayout()
-        self.models_list = QListWidget()
-        self.refresh_models_btn = QPushButton("Обновить список")
-        self.refresh_models_btn.clicked.connect(self.refresh_models_list)
-        models_layout.addWidget(self.models_list)
-        models_layout.addWidget(self.refresh_models_btn)
-        models_group.setLayout(models_layout)
-        layout.addRow("", models_group)
-        
-        return tab
-    
-    def create_whisper_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QFormLayout(tab)
-        
-        # Путь к модели Whisper
-        whisper_layout = QHBoxLayout()
-        self.whisper_path_edit = QLineEdit(self.config.whisper_model_path or "")
-        whisper_layout.addWidget(self.whisper_path_edit)
-        browse_btn = QPushButton("Обзор...")
-        browse_btn.clicked.connect(self.browse_whisper_model)
-        whisper_layout.addWidget(browse_btn)
-        layout.addRow("Путь к .pt файлу:", whisper_layout)
-        
-        # Built-in модель
+        # Выбор модели
         self.whisper_model_combo = QComboBox()
-        self.whisper_model_combo.addItems([
-            "tiny", "base", "small", "medium", "large-v2", "large-v3-turbo"
-        ])
-        if self.config.whisper_model in [item.text() for item in range(self.whisper_model_combo.count())]:
-            self.whisper_model_combo.setCurrentText(self.config.whisper_model)
-        layout.addRow("Built-in модель:", self.whisper_model_combo)
+        self.whisper_model_combo.setEditable(True)
+        layout.addRow("Модель Whisper:", self.whisper_model_combo)
+        
+        # Кнопка импорта .pt файла
+        import_btn = QPushButton("📁 Импорт .pt модели")
+        import_btn.clicked.connect(self._import_whisper_model)
+        layout.addRow("", import_btn)
+        
+        # Путь к модели
+        self.whisper_path_edit = QLineEdit()
+        self.whisper_path_edit.setPlaceholderText("Путь к файлу модели (.pt)")
+        layout.addRow("Путь к модели:", self.whisper_path_edit)
         
         # Устройство
         self.whisper_device_combo = QComboBox()
         self.whisper_device_combo.addItems(["cuda", "cpu"])
-        self.whisper_device_combo.setCurrentText(self.config.whisper_device)
         layout.addRow("Устройство:", self.whisper_device_combo)
         
         # Тип вычислений
         self.compute_type_combo = QComboBox()
-        self.compute_type_combo.addItems(["float16", "int8", "int8_float16"])
-        self.compute_type_combo.setCurrentText(self.config.whisper_compute_type)
+        self.compute_type_combo.addItems(["float16", "float32", "int8"])
         layout.addRow("Тип вычислений:", self.compute_type_combo)
         
-        # Информация
-        info_text = QTextEdit()
-        info_text.setReadOnly(True)
-        info_text.setMaximumHeight(100)
-        info_text.setText(
-            "Для импорта вашей модели large-v3-turbo.pt:\n"
-            "1. Нажмите 'Обзор...' и выберите файл .pt\n"
-            "2. Убедитесь что файл совместим с faster-whisper\n"
-            "3. Перезапустите приложение для применения настроек"
-        )
-        layout.addRow("", info_text)
+        # Язык
+        self.language_edit = QLineEdit()
+        self.language_edit.setText("ru")
+        layout.addRow("Язык по умолчанию:", self.language_edit)
         
-        return tab
-    
-    def create_audio_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QFormLayout(tab)
-        
-        # Sample rate
-        self.sr_spin = QSpinBox()
-        self.sr_spin.setRange(8000, 48000)
-        self.sr_spin.setSingleStep(8000)
-        self.sr_spin.setValue(self.config.audio_sample_rate)
-        layout.addRow("Sample Rate:", self.sr_spin)
-        
-        # Длительность чанка
-        self.chunk_spin = QDoubleSpinBox()
-        self.chunk_spin.setRange(1.0, 30.0)
-        self.chunk_spin.setSingleStep(1.0)
-        self.chunk_spin.setValue(self.config.audio_chunk_duration)
-        layout.addRow("Длительность чанка (сек):", self.chunk_spin)
-        
-        # Порог тишины
-        self.silence_spin = QDoubleSpinBox()
-        self.silence_spin.setRange(0.001, 1.0)
-        self.silence_spin.setSingleStep(0.01)
-        self.silence_spin.setValue(self.config.silence_threshold)
-        layout.addRow("Порог тишины:", self.silence_spin)
-        
-        # Диаризация
-        self.diarization_check = QCheckBox("Включить диаризацию спикеров")
-        self.diarization_check.setChecked(self.config.use_diarization)
+        # Диаризация спикеров
+        self.diarization_check = QCheckBox("Использовать диаризацию спикеров")
         layout.addRow("", self.diarization_check)
         
-        # Макс спикеров
-        self.max_speakers_spin = QSpinBox()
-        self.max_speakers_spin.setRange(1, 10)
-        self.max_speakers_spin.setValue(self.config.max_speakers)
-        layout.addRow("Макс спикеров:", self.max_speakers_spin)
-        
-        return tab
+        return widget
     
-    def create_overlay_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QFormLayout(tab)
+    def _create_llm_tab(self) -> QWidget:
+        """Создание вкладки LLM"""
+        widget = QWidget()
+        layout = QFormLayout(widget)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
         
-        # Позиция
-        self.position_combo = QComboBox()
-        self.position_combo.addItems([
-            "top_left", "top_right", "bottom_left", "bottom_right"
-        ])
-        self.position_combo.setCurrentText(self.config.overlay_position)
-        layout.addRow("Позиция:", self.position_combo)
+        # Выбор провайдера
+        self.provider_combo = QComboBox()
+        self.provider_combo.addItems(["ollama", "lmstudio", "llama_cpp"])
+        self.provider_combo.currentTextChanged.connect(self._on_provider_changed)
+        layout.addRow("Провайдер LLM:", self.provider_combo)
+        
+        # Модель
+        self.llm_model_combo = QComboBox()
+        self.llm_model_combo.setEditable(True)
+        layout.addRow("Модель LLM:", self.llm_model_combo)
+        
+        # Кнопка обновления списка моделей
+        refresh_btn = QPushButton("🔄 Обновить список моделей")
+        refresh_btn.clicked.connect(self._refresh_llm_models)
+        layout.addRow("", refresh_btn)
+        
+        # Base URL (для Ollama)
+        self.base_url_edit = QLineEdit()
+        self.base_url_edit.setText("http://localhost:11434")
+        layout.addRow("Base URL:", self.base_url_edit)
+        
+        # Порт LM Studio
+        self.lmstudio_port_spin = QSpinBox()
+        self.lmstudio_port_spin.setRange(1000, 65535)
+        self.lmstudio_port_spin.setValue(1234)
+        layout.addRow("Порт LM Studio:", self.lmstudio_port_spin)
+        
+        # Температура
+        self.temperature_spin = QDoubleSpinBox()
+        self.temperature_spin.setRange(0.0, 2.0)
+        self.temperature_spin.setSingleStep(0.1)
+        self.temperature_spin.setValue(0.7)
+        layout.addRow("Температура:", self.temperature_spin)
+        
+        # Макс токенов
+        self.max_tokens_spin = QSpinBox()
+        self.max_tokens_spin.setRange(64, 8192)
+        self.max_tokens_spin.setSingleStep(64)
+        self.max_tokens_spin.setValue(512)
+        layout.addRow("Макс токенов:", self.max_tokens_spin)
+        
+        # Тест подключения
+        test_btn = QPushButton("🔍 Тест подключения")
+        test_btn.clicked.connect(self._test_llm_connection)
+        layout.addRow("", test_btn)
+        
+        return widget
+    
+    def _create_audio_tab(self) -> QWidget:
+        """Создание вкладки Аудио"""
+        widget = QWidget()
+        layout = QFormLayout(widget)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+        
+        # Устройство ввода
+        self.audio_device_combo = QComboBox()
+        self.audio_device_combo.setEditable(True)
+        layout.addRow("Устройство ввода:", self.audio_device_combo)
+        
+        # Частота дискретизации
+        self.sample_rate_spin = QSpinBox()
+        self.sample_rate_spin.setRange(8000, 48000)
+        self.sample_rate_spin.setSingleStep(8000)
+        self.sample_rate_spin.setValue(16000)
+        layout.addRow("Частота дискретизации:", self.sample_rate_spin)
+        
+        # Каналы
+        self.channels_spin = QSpinBox()
+        self.channels_spin.setRange(1, 2)
+        self.channels_spin.setValue(1)
+        layout.addRow("Каналы:", self.channels_spin)
+        
+        # Длительность чанка
+        self.chunk_duration_spin = QDoubleSpinBox()
+        self.chunk_duration_spin.setRange(1.0, 30.0)
+        self.chunk_duration_spin.setSingleStep(1.0)
+        self.chunk_duration_spin.setValue(5.0)
+        layout.addRow("Длительность чанка (сек):", self.chunk_duration_spin)
+        
+        return widget
+    
+    def _create_screen_tab(self) -> QWidget:
+        """Создание вкладки Экран"""
+        widget = QWidget()
+        layout = QFormLayout(widget)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+        
+        # Включение захвата
+        self.screen_enabled_check = QCheckBox("Включить захват экрана")
+        layout.addRow("", self.screen_enabled_check)
+        
+        # Индекс монитора
+        self.monitor_index_spin = QSpinBox()
+        self.monitor_index_spin.setRange(0, 10)
+        self.monitor_index_spin.setValue(0)
+        layout.addRow("Индекс монитора:", self.monitor_index_spin)
+        
+        # Интервал захвата
+        self.capture_interval_spin = QDoubleSpinBox()
+        self.capture_interval_spin.setRange(1.0, 60.0)
+        self.capture_interval_spin.setSingleStep(1.0)
+        self.capture_interval_spin.setValue(10.0)
+        layout.addRow("Интервал захвата (сек):", self.capture_interval_spin)
+        
+        # Ширина
+        self.resize_width_spin = QSpinBox()
+        self.resize_width_spin.setRange(320, 1920)
+        self.resize_width_spin.setSingleStep(80)
+        self.resize_width_spin.setValue(800)
+        layout.addRow("Ширина скриншота:", self.resize_width_spin)
+        
+        # Высота
+        self.resize_height_spin = QSpinBox()
+        self.resize_height_spin.setRange(240, 1080)
+        self.resize_height_spin.setSingleStep(60)
+        self.resize_height_spin.setValue(600)
+        layout.addRow("Высота скриншота:", self.resize_height_spin)
+        
+        return widget
+    
+    def _create_overlay_tab(self) -> QWidget:
+        """Создание вкладки Оверлей"""
+        widget = QWidget()
+        layout = QFormLayout(widget)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+        
+        # Позиция X
+        self.overlay_x_spin = QSpinBox()
+        self.overlay_x_spin.setRange(0, 3840)
+        self.overlay_x_spin.setValue(100)
+        layout.addRow("Позиция X:", self.overlay_x_spin)
+        
+        # Позиция Y
+        self.overlay_y_spin = QSpinBox()
+        self.overlay_y_spin.setRange(0, 2160)
+        self.overlay_y_spin.setValue(100)
+        layout.addRow("Позиция Y:", self.overlay_y_spin)
+        
+        # Ширина
+        self.overlay_width_spin = QSpinBox()
+        self.overlay_width_spin.setRange(200, 800)
+        self.overlay_width_spin.setValue(400)
+        layout.addRow("Ширина окна:", self.overlay_width_spin)
+        
+        # Высота
+        self.overlay_height_spin = QSpinBox()
+        self.overlay_height_spin.setRange(150, 600)
+        self.overlay_height_spin.setValue(300)
+        layout.addRow("Высота окна:", self.overlay_height_spin)
         
         # Прозрачность
         self.opacity_spin = QDoubleSpinBox()
         self.opacity_spin.setRange(0.1, 1.0)
         self.opacity_spin.setSingleStep(0.1)
-        self.opacity_spin.setValue(self.config.overlay_opacity)
+        self.opacity_spin.setValue(0.8)
         layout.addRow("Прозрачность:", self.opacity_spin)
         
         # Размер шрифта
         self.font_size_spin = QSpinBox()
-        self.font_size_spin.setRange(8, 72)
-        self.font_size_spin.setValue(self.config.overlay_font_size)
+        self.font_size_spin.setRange(10, 24)
+        self.font_size_spin.setValue(14)
         layout.addRow("Размер шрифта:", self.font_size_spin)
         
-        # Ширина
-        self.max_width_spin = QSpinBox()
-        self.max_width_spin.setRange(200, 2000)
-        self.max_width_spin.setValue(self.config.overlay_max_width)
-        layout.addRow("Макс ширина:", self.max_width_spin)
-        
-        return tab
+        return widget
     
-    def on_provider_changed(self, provider: str):
-        """Изменение провайдера"""
-        if provider == "lmstudio":
-            self.host_edit.setText("http://localhost:1234")
-        elif provider == "ollama":
-            self.host_edit.setText("http://localhost:11434")
-    
-    def check_connection(self):
-        """Проверка соединения с провайдером"""
-        provider = self.provider_combo.currentText()
-        host = self.host_edit.text()
+    def _load_current_settings(self):
+        """Загрузка текущих настроек в интерфейс"""
+        # Whisper
+        available_models = get_available_whisper_models()
+        self.whisper_model_combo.clear()
+        self.whisper_model_combo.addItems(available_models)
+        if self.config.whisper.model_name in available_models:
+            self.whisper_model_combo.setCurrentText(self.config.whisper.model_name)
         
+        if self.config.whisper.model_path:
+            self.whisper_path_edit.setText(self.config.whisper.model_path)
+        
+        self.whisper_device_combo.setCurrentText(self.config.whisper.device)
+        self.compute_type_combo.setCurrentText(self.config.whisper.compute_type)
+        self.language_edit.setText(self.config.whisper.language)
+        self.diarization_check.setChecked(self.config.whisper.use_speaker_diarization)
+        
+        # LLM
+        self.provider_combo.setCurrentText(self.config.llm.provider)
+        self.llm_model_combo.setCurrentText(self.config.llm.model_name)
+        self.base_url_edit.setText(self.config.llm.base_url)
+        self.lmstudio_port_spin.setValue(self.config.llm.lmstudio_port)
+        self.temperature_spin.setValue(self.config.llm.temperature)
+        self.max_tokens_spin.setValue(self.config.llm.max_tokens)
+        
+        # Audio
+        if self.config.audio.input_device:
+            self.audio_device_combo.setCurrentText(self.config.audio.input_device)
+        self.sample_rate_spin.setValue(self.config.audio.sample_rate)
+        self.channels_spin.setValue(self.config.audio.channels)
+        self.chunk_duration_spin.setValue(self.config.audio.chunk_duration)
+        
+        # Screen
+        self.screen_enabled_check.setChecked(self.config.screen.enabled)
+        self.monitor_index_spin.setValue(self.config.screen.monitor_index)
+        self.capture_interval_spin.setValue(self.config.screen.capture_interval)
+        self.resize_width_spin.setValue(self.config.screen.resize_width)
+        self.resize_height_spin.setValue(self.config.screen.resize_height)
+        
+        # Overlay
+        self.overlay_x_spin.setValue(self.config.overlay.position_x)
+        self.overlay_y_spin.setValue(self.config.overlay.position_y)
+        self.overlay_width_spin.setValue(self.config.overlay.width)
+        self.overlay_height_spin.setValue(self.config.overlay.height)
+        self.opacity_spin.setValue(self.config.overlay.opacity)
+        self.font_size_spin.setValue(self.config.overlay.font_size)
+        
+        # Заполнение аудио устройств
         try:
-            if provider == "ollama":
-                response = requests.get(f"{host}/api/tags", timeout=5)
-                if response.status_code == 200:
-                    QMessageBox.information(self, "Успех", "Ollama подключен!")
-                    self.refresh_models_list()
-                else:
-                    QMessageBox.warning(self, "Ошибка", f"Ollama ответил: {response.status_code}")
-            
-            elif provider == "lmstudio":
-                response = requests.get(f"{host}/v1/models", timeout=5)
-                if response.status_code == 200:
-                    QMessageBox.information(self, "Успех", "LM Studio подключен!")
-                    self.refresh_models_list()
-                else:
-                    QMessageBox.warning(self, "Ошибка", f"LM Studio ответил: {response.status_code}")
-            
-            elif provider == "llama_cpp":
-                QMessageBox.information(
-                    self, "Инфо", 
-                    "llama.cpp работает локально без сервера. "
-                    "Укажите путь к .gguf файлу в поле 'Модель'."
-                )
-        
+            import sounddevice as sd
+            devices = sd.query_devices()
+            self.audio_device_combo.clear()
+            for i, dev in enumerate(devices):
+                if dev['max_input_channels'] > 0:
+                    self.audio_device_combo.addItem(f"{dev['name']} ({i})")
         except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Не удалось подключиться: {str(e)}")
+            print(f"Ошибка получения списка аудио устройств: {e}")
     
-    def refresh_models_list(self):
-        """Обновление списка доступных моделей"""
-        provider = self.provider_combo.currentText()
-        host = self.host_edit.text()
-        
-        self.models_list.clear()
-        
-        try:
-            if provider == "ollama":
-                response = requests.get(f"{host}/api/tags", timeout=5)
-                if response.status_code == 200:
-                    models = response.json().get("models", [])
-                    for model in models:
-                        name = model.get("name", "unknown")
-                        size = model.get("size", 0)
-                        size_gb = size / (1024**3) if size > 0 else 0
-                        self.models_list.addItem(f"{name} ({size_gb:.1f} GB)")
-            
-            elif provider == "lmstudio":
-                response = requests.get(f"{host}/v1/models", timeout=5)
-                if response.status_code == 200:
-                    models_data = response.json().get("data", [])
-                    for model in models_data:
-                        model_id = model.get("id", "unknown")
-                        self.models_list.addItem(model_id)
-            
-            if self.models_list.count() == 0:
-                self.models_list.addItem("Нет доступных моделей")
-        
-        except Exception as e:
-            self.models_list.addItem(f"Ошибка: {str(e)}")
-    
-    def download_model(self):
-        """Загрузка модели"""
-        provider = self.provider_combo.currentText()
-        host = self.host_edit.text()
-        model_name = self.model_edit.text()
-        
-        if not model_name:
-            QMessageBox.warning(self, "Ошибка", "Введите имя модели")
-            return
-        
-        self.downloader = ModelDownloader(provider, host, model_name)
-        self.downloader.progress.connect(self.on_download_progress)
-        self.downloader.finished.connect(self.on_download_finished)
-        
-        self.download_progress.setVisible(True)
-        self.download_progress.setValue(0)
-        self.download_status.setText("Starting download...")
-        self.download_model_btn.setEnabled(False)
-        
-        self.downloader.start()
-    
-    def on_download_progress(self, percent: int, message: str):
-        """Обновление прогресса загрузки"""
-        self.download_progress.setValue(percent)
-        self.download_status.setText(message)
-    
-    def on_download_finished(self, success: bool, message: str):
-        """Завершение загрузки"""
-        self.download_model_btn.setEnabled(True)
-        
-        if success:
-            QMessageBox.information(self, "Успех", message)
-            self.refresh_models_list()
-        else:
-            QMessageBox.warning(self, "Инфо", message)
-    
-    def browse_whisper_model(self):
-        """Выбор файла Whisper модели"""
+    def _import_whisper_model(self):
+        """Импорт .pt модели Whisper"""
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Выберите Whisper модель",
+            "Выберите модель Whisper (.pt)",
             "",
             "PyTorch Models (*.pt);;All Files (*)"
         )
         
         if file_path:
-            self.whisper_path_edit.setText(file_path)
+            # Копирование файла в директорию моделей
+            import shutil
+            filename = os.path.basename(file_path)
+            dest_path = MODELS_DIR / filename
+            
+            try:
+                shutil.copy2(file_path, dest_path)
+                self.whisper_path_edit.setText(str(dest_path))
+                
+                # Обновление списка моделей
+                available_models = get_available_whisper_models()
+                self.whisper_model_combo.clear()
+                self.whisper_model_combo.addItems(available_models)
+                self.whisper_model_combo.setCurrentText(filename)
+                
+                QMessageBox.information(self, "Успех", f"Модель {filename} успешно импортирована!")
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка", f"Не удалось импортировать модель: {e}")
     
-    def save_settings(self):
-        """Сохранение настроек"""
-        # LLM
-        self.config.llm_provider = self.provider_combo.currentText()
-        self.config.llm_host = self.host_edit.text()
-        self.config.llm_model = self.model_edit.text()
-        self.config.llm_temperature = self.temp_spin.value()
-        self.config.llm_max_tokens = self.max_tokens_spin.value()
+    def _on_provider_changed(self, provider: str):
+        """Обработчик изменения провайдера"""
+        # Можно добавить логику для автоматического обновления URL и портов
+    
+    def _refresh_llm_models(self):
+        """Обновление списка LLM моделей"""
+        provider = self.provider_combo.currentText()
         
+        try:
+            temp_config = Config()
+            temp_config.llm.provider = provider
+            temp_config.llm.base_url = self.base_url_edit.text()
+            temp_config.llm.lmstudio_port = self.lmstudio_port_spin.value()
+            
+            engine = LLMEngine(temp_config)
+            models = engine.get_available_models()
+            
+            self.llm_model_combo.clear()
+            self.llm_model_combo.addItems(models)
+            
+            if models:
+                QMessageBox.information(self, "Успех", f"Найдено моделей: {len(models)}")
+            else:
+                QMessageBox.warning(self, "Предупреждение", "Модели не найдены. Проверьте подключение.")
+        
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не удалось получить список моделей: {e}")
+    
+    def _test_llm_connection(self):
+        """Тестирование подключения к LLM"""
+        provider = self.provider_combo.currentText()
+        
+        try:
+            temp_config = Config()
+            temp_config.llm.provider = provider
+            temp_config.llm.base_url = self.base_url_edit.text()
+            temp_config.llm.lmstudio_port = self.lmstudio_port_spin.value()
+            temp_config.llm.model_name = self.llm_model_combo.currentText()
+            
+            engine = LLMEngine(temp_config)
+            result = engine.test_connection()
+            
+            if result["success"]:
+                QMessageBox.information(self, "Успех", result["message"])
+            else:
+                QMessageBox.warning(self, "Ошибка подключения", result["message"])
+        
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Тест не удался: {e}")
+    
+    def _save_settings(self):
+        """Сохранение настроек"""
         # Whisper
-        self.config.whisper_model_path = self.whisper_path_edit.text() or None
-        self.config.whisper_model = self.whisper_model_combo.currentText()
-        self.config.whisper_device = self.whisper_device_combo.currentText()
-        self.config.whisper_compute_type = self.compute_type_combo.currentText()
+        self.config.whisper.model_name = self.whisper_model_combo.currentText()
+        self.config.whisper.model_path = self.whisper_path_edit.text()
+        self.config.whisper.device = self.whisper_device_combo.currentText()
+        self.config.whisper.compute_type = self.compute_type_combo.currentText()
+        self.config.whisper.language = self.language_edit.text()
+        self.config.whisper.use_speaker_diarization = self.diarization_check.isChecked()
+        
+        # LLM
+        self.config.llm.provider = self.provider_combo.currentText()
+        self.config.llm.model_name = self.llm_model_combo.currentText()
+        self.config.llm.base_url = self.base_url_edit.text()
+        self.config.llm.lmstudio_port = self.lmstudio_port_spin.value()
+        self.config.llm.temperature = self.temperature_spin.value()
+        self.config.llm.max_tokens = self.max_tokens_spin.value()
         
         # Audio
-        self.config.audio_sample_rate = self.sr_spin.value()
-        self.config.audio_chunk_duration = self.chunk_spin.value()
-        self.config.silence_threshold = self.silence_spin.value()
-        self.config.use_diarization = self.diarization_check.isChecked()
-        self.config.max_speakers = self.max_speakers_spin.value()
+        device_text = self.audio_device_combo.currentText()
+        if device_text:
+            # Извлечение имени устройства из строки "name (index)"
+            if " (" in device_text:
+                self.config.audio.input_device = device_text.split(" (")[0]
+            else:
+                self.config.audio.input_device = device_text
+        
+        self.config.audio.sample_rate = self.sample_rate_spin.value()
+        self.config.audio.channels = self.channels_spin.value()
+        self.config.audio.chunk_duration = self.chunk_duration_spin.value()
+        
+        # Screen
+        self.config.screen.enabled = self.screen_enabled_check.isChecked()
+        self.config.screen.monitor_index = self.monitor_index_spin.value()
+        self.config.screen.capture_interval = self.capture_interval_spin.value()
+        self.config.screen.resize_width = self.resize_width_spin.value()
+        self.config.screen.resize_height = self.resize_height_spin.value()
         
         # Overlay
-        self.config.overlay_position = self.position_combo.currentText()
-        self.config.overlay_opacity = self.opacity_spin.value()
-        self.config.overlay_font_size = self.font_size_spin.value()
-        self.config.overlay_max_width = self.max_width_spin.value()
+        self.config.overlay.position_x = self.overlay_x_spin.value()
+        self.config.overlay.position_y = self.overlay_y_spin.value()
+        self.config.overlay.width = self.overlay_width_spin.value()
+        self.config.overlay.height = self.overlay_height_spin.value()
+        self.config.overlay.opacity = self.opacity_spin.value()
+        self.config.overlay.font_size = self.font_size_spin.value()
         
-        logger.info("Settings saved")
-        self.accept()
-
-
-def show_settings_dialog(config):
-    """Показать диалог настроек"""
-    if not PYQT_AVAILABLE:
-        logger.error("PyQt6 is required for settings GUI")
-        print("Error: PyQt6 is required for settings GUI")
-        print("Install with: pip install PyQt6")
-        return False
-    
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication(sys.argv)
-    
-    dialog = SettingsDialog(config)
-    result = dialog.exec()
-    
-    return result == QDialog.DialogCode.Accepted
-
-
-if __name__ == "__main__":
-    # Тестовый запуск
-    from config import config
-    
-    app = QApplication(sys.argv)
-    dialog = SettingsDialog(config)
-    dialog.show()
-    sys.exit(app.exec())
+        # Сохранение в файл
+        save_config(self.config)
+        
+        # Отправка сигнала
+        self.settings_saved.emit(self.config)
+        
+        QMessageBox.information(self, "Успех", "Настройки успешно сохранены!")
+        self.close()
