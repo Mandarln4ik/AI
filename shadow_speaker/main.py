@@ -1,290 +1,239 @@
-"""
-ShadowSpeaker - Главный файл приложения
-Локальный ИИ-ассистент для помощи в диалогах
-"""
 import sys
-import time
-import threading
-from loguru import logger
-from typing import Optional
-
-from config import config
-from audio_capturer import AudioCapturer
-from speech_recognizer import SpeechRecognizer, SpeechSegment
+import asyncio
+from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import QTimer, QThread, pyqtSignal
+from config import load_config, save_config, Config
+from speech_recognizer import SpeechRecognizer
+from screen_capture import ScreenCapture
 from llm_engine import LLMEngine
-from speaker_manager import SpeakerManager
-from overlay_ui import OverlayManager
+from overlay_ui import OverlayWindow
+from settings_gui import SettingsWindow
 
 
-class ShadowSpeaker:
-    """
-    Основное приложение ShadowSpeaker
-    """
+class WorkerThread(QThread):
+    """Рабочий поток для обработки задач ИИ"""
+    response_ready = pyqtSignal(list)  # Сигнал готовности вариантов ответа
     
-    def __init__(self, config):
-        self.config = config
+    def __init__(self, llm_engine: LLMEngine, speech_recognizer: SpeechRecognizer, screen_capture: ScreenCapture):
+        super().__init__()
+        self.llm_engine = llm_engine
+        self.speech_recognizer = speech_recognizer
+        self.screen_capture = screen_capture
+        self.is_running = False
+    
+    def run(self):
+        """Основной цикл обработки"""
+        self.is_running = True
         
-        # Настраиваем логирование
-        self._setup_logging()
+        while self.is_running:
+            try:
+                # Получение контекста диалога
+                dialogue_context = self.speech_recognizer.get_memory().get_context()
+                
+                if not dialogue_context:
+                    # Если нет диалога, ждем
+                    self.msleep(1000)
+                    continue
+                
+                # Получение визуального контекста
+                screen_context = ""
+                screenshot_base64 = None
+                
+                if self.screen_capture.enabled:
+                    screen_context = self.screen_capture.get_screenshot_context()
+                    screenshot_base64 = self.screen_capture.get_latest_screenshot_base64()
+                
+                # Генерация ответов
+                options = self.llm_engine.generate_response(
+                    dialogue_context=dialogue_context,
+                    screen_context=screen_context,
+                    screenshot_base64=screenshot_base64,
+                    num_options=3
+                )
+                
+                # Отправка результатов в главный поток
+                self.response_ready.emit(options)
+                
+                # Пауза перед следующей генерацией (чтобы не спамить)
+                self.msleep(5000)
+                
+            except Exception as e:
+                print(f"Ошибка в рабочем потоке: {e}")
+                self.msleep(2000)
+    
+    def stop(self):
+        """Остановка потока"""
+        self.is_running = False
+        self.wait(2000)
+
+
+class ShadowSpeakerApp:
+    """Основное приложение ShadowSpeaker"""
+    
+    def __init__(self):
+        # Загрузка конфигурации
+        self.config = load_config()
+        
+        # Инициализация Qt приложения
+        self.app = QApplication(sys.argv)
+        self.app.setApplicationName("ShadowSpeaker")
         
         # Компоненты
-        self.audio_capturer: Optional[AudioCapturer] = None
-        self.speech_recognizer: Optional[SpeechRecognizer] = None
-        self.llm_engine: Optional[LLMEngine] = None
-        self.speaker_manager: Optional[SpeakerManager] = None
-        self.overlay_manager: Optional[OverlayManager] = None
-        self.screen_capture = None  # Захват экрана для визуального контекста
+        self.speech_recognizer = None
+        self.screen_capture = None
+        self.llm_engine = None
+        self.overlay = None
+        self.settings_window = None
+        self.worker_thread = None
         
-        # Состояние
-        self.is_running = False
-        self.is_processing = False
-        self.current_variants = []
-        
-        logger.info("=" * 50)
-        logger.info("ShadowSpeaker initialized")
-        logger.info(f"Config: whisper={config.whisper_model_name}, llm={config.llm_model}")
-        logger.info(f"Screen capture: {config.enable_screen_capture}")
-        logger.info("=" * 50)
+        # Флаг активности
+        self.is_active = False
     
-    def _setup_logging(self):
-        """Настройка логирования"""
-        logger.remove()  # Убираем стандартный handler
-        
-        # Консоль
-        logger.add(
-            sys.stderr,
-            level=self.config.log_level,
-            format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan> - <level>{message}</level>"
-        )
-        
-        # Файл
-        logger.add(
-            self.config.logs_dir / self.config.log_file,
-            level="DEBUG",
-            rotation="10 MB",
-            retention="7 days"
-        )
-    
-    def initialize(self) -> bool:
+    def initialize_components(self):
         """Инициализация всех компонентов"""
+        print("Инициализация компонентов...")
+        
+        # Распознавание речи
         try:
-            logger.info("Initializing components...")
-            
-            # Audio Capturer
-            self.audio_capturer = AudioCapturer(self.config)
-            devices = self.audio_capturer.list_available_devices()
-            logger.info(f"Available audio devices: {len(devices)}")
-            
-            # Speech Recognizer
             self.speech_recognizer = SpeechRecognizer(self.config)
-            if not self.speech_recognizer.initialize():
-                logger.error("Failed to initialize speech recognizer")
-                return False
-            
-            # LLM Engine
-            self.llm_engine = LLMEngine(self.config)
-            if not self.llm_engine.initialize():
-                logger.warning("LLM engine not available, will use fallback responses")
-            
-            # Speaker Manager
-            self.speaker_manager = SpeakerManager(self.config)
-            
-            # Screen Capture (для визуального контекста)
-            if self.config.enable_screen_capture:
-                try:
-                    from screen_capture import ScreenCapture
-                    self.screen_capture = ScreenCapture(
-                        monitor_index=self.config.screen_monitor_index
-                    )
-                    self.screen_capture.set_capture_interval(
-                        self.config.screen_capture_interval
-                    )
-                    logger.info("Screen capture enabled")
-                except Exception as e:
-                    logger.warning(f"Screen capture initialization failed: {e}")
-                    self.screen_capture = None
-            
-            # Overlay Manager
-            self.overlay_manager = OverlayManager(self.config)
-            self.overlay_manager.start(
-                on_variant_selected=self._on_variant_selected,
-                on_refresh=self._on_refresh_requested,
-                on_toggle=self._on_toggle_overlay,
-                on_quit=self._on_quit
-            )
-            
-            logger.info("All components initialized successfully")
-            return True
-            
+            self.speech_recognizer.register_callback(self.on_speech_detected)
+            print("✓ Распознавание речи инициализировано")
         except Exception as e:
-            logger.error(f"Initialization failed: {e}")
-            return False
+            print(f"✗ Ошибка инициализации распознавания речи: {e}")
+            self.speech_recognizer = None
+        
+        # Захват экрана
+        try:
+            self.screen_capture = ScreenCapture(self.config)
+            print("✓ Захват экрана инициализирован")
+        except Exception as e:
+            print(f"✗ Ошибка инициализации захвата экрана: {e}")
+            self.screen_capture = None
+        
+        # LLM движок
+        try:
+            self.llm_engine = LLMEngine(self.config)
+            print(f"✓ LLM движок инициализирован ({self.config.llm.provider})")
+        except Exception as e:
+            print(f"✗ Ошибка инициализации LLM движка: {e}")
+            self.llm_engine = None
+        
+        # Оверлей
+        try:
+            self.overlay = OverlayWindow(self.config)
+            self.overlay.option_selected.connect(self.on_option_selected)
+            self.overlay.settings_requested.connect(self.show_settings)
+            print("✓ Оверлей инициализирован")
+        except Exception as e:
+            print(f"✗ Ошибка инициализации оверлея: {e}")
+            self.overlay = None
+        
+        # Рабочий поток
+        if self.llm_engine and self.speech_recognizer and self.screen_capture:
+            self.worker_thread = WorkerThread(
+                self.llm_engine,
+                self.speech_recognizer,
+                self.screen_capture
+            )
+            self.worker_thread.response_ready.connect(self.on_response_ready)
+            print("✓ Рабочий поток инициализирован")
     
     def start(self):
         """Запуск приложения"""
-        if not self.initialize():
-            logger.error("Failed to initialize, exiting")
-            return
+        print("\n🚀 Запуск ShadowSpeaker...")
         
-        self.is_running = True
+        self.initialize_components()
         
-        # Запускаем захват аудио в отдельном потоке
-        audio_thread = threading.Thread(target=self._audio_processing_loop, daemon=True)
-        audio_thread.start()
+        # Запуск компонентов
+        if self.speech_recognizer:
+            self.speech_recognizer.start_listening(self.config.audio.input_device)
         
-        logger.info("ShadowSpeaker started - listening for conversations")
-        logger.info("Press Ctrl+Q or close the window to exit")
+        if self.screen_capture:
+            self.screen_capture.start_capture()
         
-        # Запускаем Qt event loop (блокирующий)
-        self.overlay_manager.run()
-    
-    def _audio_processing_loop(self):
-        """Основной цикл обработки аудио"""
-        def on_audio_chunk(audio_data):
-            if self.is_processing:
-                return
-            
-            # Проверяем наличие речи
-            if not self.audio_capturer.detect_speech_activity(audio_data):
-                return
-            
-            # Обрабатываем аудио
-            self.is_processing = True
-            try:
-                segments = self.speech_recognizer.transcribe_audio(audio_data)
-                
-                for segment in segments:
-                    self._process_speech_segment(segment)
-                    
-            finally:
-                self.is_processing = False
+        if self.worker_thread:
+            self.worker_thread.start()
         
-        # Запускаем захват
-        if not self.audio_capturer.start_capture(on_audio_chunk):
-            logger.error("Failed to start audio capture")
-            return
+        self.is_active = True
         
-        # Держим поток активным
-        while self.is_running:
-            time.sleep(0.1)
+        # Показ оверлея (скрытого по умолчанию)
+        if self.overlay:
+            self.overlay.hide()
         
-        self.audio_capturer.stop_capture()
-    
-    def _process_speech_segment(self, segment: SpeechSegment):
-        """Обработка распознанного сегмента речи"""
-        logger.info(f"Speech detected: [{segment.speaker}] {segment.text}")
+        print("\n✅ ShadowSpeaker запущен!")
+        print("Горячие клавиши:")
+        print("  Ctrl+S - Настройки")
+        print("  Ctrl+1/2/3 - Выбор варианта ответа")
+        print("\nНажмите Ctrl+C для выхода\n")
         
-        # Регистрируем спикера
-        self.speaker_manager.record_utterance(
-            segment.speaker,
-            segment.text,
-            segment.end_time - segment.start_time
-        )
-        
-        # Добавляем в историю LLM с временной меткой
-        self.llm_engine.add_to_history(segment.speaker, segment.text)
-        
-        # Если это не пользователь и есть контекст - генерируем ответ
-        user_speaker = self.speaker_manager.user_speaker_id
-        
-        if user_speaker and segment.speaker != user_speaker:
-            # Получаем контекст диалога за последние 5 минут
-            context = self.speech_recognizer.get_conversation_context(last_n_segments=20)
-            
-            # Получаем визуальный контекст если включено
-            screen_context = ""
-            if hasattr(self, 'screen_capture') and self.screen_capture:
-                screen_context = self.screen_capture.get_context_description()
-            
-            # Генерируем варианты ответов
-            variants = self.llm_engine.generate_response_variants(
-                context, 
-                user_speaker,
-                screen_context=screen_context
-            )
-            
-            if variants:
-                self.current_variants = variants
-                self.overlay_manager.update_variants(variants)
-                logger.info(f"Generated {len(variants)} response variants")
-    
-    def _on_variant_selected(self, index: int):
-        """Обработчик выбора варианта ответа"""
-        if 0 <= index < len(self.current_variants):
-            selected_text = self.current_variants[index]["text"]
-            logger.info(f"User selected variant {index + 1}: {selected_text}")
-            
-            # Копируем в буфер обмена (можно добавить автоввод)
-            try:
-                import pyperclip
-                pyperclip.copy(selected_text)
-                logger.info("Response copied to clipboard")
-            except ImportError:
-                logger.debug("pyperclip not installed, cannot copy to clipboard")
-            
-            # Добавляем выбранный ответ в историю
-            if self.speaker_manager.user_speaker_id:
-                self.llm_engine.add_to_history(
-                    self.speaker_manager.user_speaker_id,
-                    selected_text
-                )
-            
-            # Очищаем варианты после выбора
-            self.overlay_manager.clear_variants()
-            self.current_variants = []
-    
-    def _on_refresh_requested(self):
-        """Запрос на обновление вариантов"""
-        logger.info("Refresh requested")
-        
-        if self.speaker_manager.user_speaker_id:
-            context = self.speech_recognizer.get_conversation_context()
-            variants = self.llm_engine.generate_response_variants(
-                context,
-                self.speaker_manager.user_speaker_id
-            )
-            
-            if variants:
-                self.current_variants = variants
-                self.overlay_manager.update_variants(variants)
-    
-    def _on_toggle_overlay(self):
-        """Переключение видимости оверлея"""
-        logger.info("Toggle overlay requested")
-        if self.overlay_manager.window:
-            self.overlay_manager.window.toggle_visibility()
-    
-    def _on_quit(self):
-        """Выход из приложения"""
-        logger.info("Quit requested")
-        self.stop()
+        # Запуск Qt цикла
+        sys.exit(self.app.exec())
     
     def stop(self):
         """Остановка приложения"""
-        logger.info("Stopping ShadowSpeaker...")
-        self.is_running = False
+        print("\n🛑 Остановка ShadowSpeaker...")
         
-        if self.audio_capturer:
-            self.audio_capturer.stop_capture()
+        self.is_active = False
         
-        if self.overlay_manager:
-            self.overlay_manager.stop()
+        # Остановка компонентов
+        if self.speech_recognizer:
+            self.speech_recognizer.stop_listening()
         
-        logger.info("ShadowSpeaker stopped")
+        if self.screen_capture:
+            self.screen_capture.stop_capture()
+        
+        if self.worker_thread:
+            self.worker_thread.stop()
+        
+        print("✅ ShadowSpeaker остановлен")
+    
+    def on_speech_detected(self, messages):
+        """Обработчик обнаружения речи"""
+        for msg in messages:
+            print(f"[{msg.timestamp.strftime('%H:%M:%S')}] Спикер {msg.speaker_id}: {msg.text}")
+    
+    def on_response_ready(self, options):
+        """Обработчик готовности вариантов ответа"""
+        if self.overlay and options:
+            # Обновление оверлея в главном потоке
+            QTimer.singleShot(0, lambda: self.overlay.update_options(options))
+    
+    def on_option_selected(self, index):
+        """Обработчик выбора варианта ответа"""
+        if self.overlay and index < len(self.overlay.current_options):
+            selected_text = self.overlay.current_options[index]
+            print(f"\n💬 Выбран вариант {index + 1}: {selected_text}")
+            # Здесь можно добавить копирование в буфер обмена или автоматический ввод
+    
+    def show_settings(self):
+        """Показ окна настроек"""
+        if self.settings_window is None:
+            self.settings_window = SettingsWindow(self.config)
+            self.settings_window.settings_saved.connect(self.on_settings_saved)
+        
+        self.settings_window.show()
+        self.settings_window.activateWindow()
+    
+    def on_settings_saved(self, new_config: Config):
+        """Обработчик сохранения настроек"""
+        print("Настройки сохранены, применяем изменения...")
+        self.config = new_config
+        
+        # Перезапуск компонентов с новыми настройками
+        # (в полной версии нужно корректно перезапустить компоненты)
 
 
 def main():
     """Точка входа"""
-    app = ShadowSpeaker(config)
-    
     try:
+        app = ShadowSpeakerApp()
         app.start()
     except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-        app.stop()
+        print("\nПрервано пользователем")
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        app.stop()
+        print(f"Критическая ошибка: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 
